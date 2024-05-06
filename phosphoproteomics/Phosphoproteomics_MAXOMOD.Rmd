@@ -1,0 +1,1168 @@
+---
+title: "Phosphoroteomics MAXOMOD"
+author: "Clara Meijs"
+date: "2024-01-31"
+output:
+  html_document:
+    df_print: paged
+    keep_md: yes
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 5
+    theme: lumen
+---
+
+## Loading the libraries
+
+Start with clearing environment and loading packages
+
+```{r libraries, results='hide', message=FALSE,class.source = 'fold-hide'}
+set.seed(9)
+rm(list=ls())
+
+ library(pheatmap)
+ library(ggplot2)
+ library(matrixStats)
+ library(wesanderson)
+ library(clusterProfiler)
+ library(enrichplot)
+ library(msigdbr)
+ library(dichromat)
+ library(stringr)
+ library(dplyr)
+ library(ggrepel)
+ library(reshape2)
+ library(umap)
+ library(ggthemes)
+ library(cowplot)
+ library(DEP)
+ library(naniar)
+ library(SummarizedExperiment)
+ library(data.table)
+ library(org.Hs.eg.db)
+
+```
+
+## Set working directories
+
+```{r set-working-directories,message=FALSE,class.source = 'fold-hide'}
+# if you are using Rstudio run the following command, otherwise, set the working directory to the folder where this script is in
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# create directory for results
+dir.create(file.path(getwd(),'results'), showWarnings = FALSE)
+# create directory for plots
+dir.create(file.path(getwd(),'plots'), showWarnings = FALSE)
+```
+
+## Load data
+
+```{r load data}
+
+#load expression data
+      phpr_data <- read.delim("data/Phospho (STY)Sites_pCSF_08.2023.txt")
+      
+      Intensity_names = colnames(phpr_data)[grep("Intensity.", colnames(phpr_data))]
+      Intensity_names = Intensity_names[-grep("___", Intensity_names)]
+      
+      abu_data = phpr_data[,c("Proteins","Potential.contaminant", "Reverse", "Positions.within.proteins",Intensity_names)]
+      
+      #size of the abundancy data:
+      dim(abu_data)
+      
+      #remove proteins with the word "CON" or "Sigma_Phosphopeptide" in their name
+      abu_data = abu_data[-grep("CON", abu_data$Proteins),]
+      abu_data = abu_data[-grep("Sigma_Phosphopeptide", abu_data$Proteins),]
+      
+      #remove potential contaminats & reverse proteins
+      abu_data = data.table(abu_data[abu_data$Potential.contaminant != "+", ])
+      abu_data[, Potential.contaminant := NULL]
+      abu_data = data.table(abu_data[abu_data$Reverse != "+", ])
+      abu_data[, Reverse := NULL]
+      #remove proteins with no name
+      abu_data = data.table(abu_data[abu_data$Proteins != "", ])
+      
+      #size of the abundancy data:
+      dim(abu_data)
+      
+      #change sample names
+      #colnames(abu_data) = gsub("Intensity.", "", colnames(abu_data))
+      colnames(abu_data) = gsub("Ctr.", "Ctr ", colnames(abu_data))
+      colnames(abu_data)[colnames(abu_data) == "Intensity.ALS54.CTRL54"] = "Intensity.ALS54-CTRL54"
+      protein_names = abu_data$Proteins
+      
+      #make a better list of Uniprot accession numbers and their gene names
+      f = function(x){ 
+        names = str_split(x, pattern = ";")[[1]]
+        name = unlist(strsplit(x, split=';', fixed=TRUE))[length(names)]
+        uniprot = unlist(strsplit(name, split='|', fixed=TRUE))[2]
+        symbol = unlist(strsplit(name, split='|', fixed=TRUE))[3]
+        symbol = gsub("_HUMAN", "", symbol)
+        return(list(name = name, uniprot = uniprot, symbol = symbol))}
+      
+      name = uniprot = symbol = character()
+      
+      for(i in 1:length(protein_names)){
+        name[i] = f(protein_names[i])[["name"]]
+        uniprot[i] = f(protein_names[i])[["uniprot"]]
+        symbol[i] = f(protein_names[i])[["symbol"]]
+      }
+      symbol[is.na(symbol)] = uniprot[is.na(symbol)]
+      
+      colnames(abu_data)[1] = "orig_name"
+      abu_data$full_name = name
+      abu_data$symbol = symbol
+      abu_data$uniprot = uniprot
+      # abu_data$ID = make.unique(uniprot)
+      # abu_data$name = make.unique(symbol)
+      # abu_data$ID_loc <- paste(uniprot, abu_data$Positions.within.proteins, sep = "_p")
+      abu_data$ID = paste(uniprot, abu_data$Positions.within.proteins, sep = "_p")
+      
+      #remove duplicates
+      abu_data = abu_data %>% distinct(abu_data$ID, .keep_all = TRUE)
+      
+      #size of the abundancy data:
+      dim(abu_data)
+
+      #change the gene names to uniprot and then to better gene name again
+      genes = AnnotationDbi::select(org.Hs.eg.db, uniprot, "SYMBOL", "UNIPROT")
+      genes = genes %>% distinct(genes$UNIPROT, .keep_all = TRUE)
+      for(i in 1:nrow(abu_data)){
+        if((abu_data$uniprot %in% genes$UNIPROT)[i]){
+          abu_data$symbol[i] = genes$SYMBOL[genes$UNIPROT == abu_data$uniprot[i]]
+        }
+      }
+      abu_data$symbol[is.na(abu_data$symbol)] = abu_data$uniprot[is.na(abu_data$symbol)]
+      
+      #abu_data$name_loc = paste(abu_data$symbol, abu_data$Positions.within.proteins, sep = "_p")
+      abu_data$name = paste(abu_data$symbol, abu_data$Positions.within.proteins, sep = "_p")
+
+      #make all zeroes NA
+      abu_data[abu_data == 0] <- NA
+
+#load new clinical dataset
+      clin = read.csv(file = "data/Clinical_information_FINAL.csv")
+      clin = clin[, c("MAXOMOD.ID","Tube.ID","CSF.phosphoproteomics.ID", "Group", "Gender", "Age.at.collection", "NfL..pg.ml.", "Genetics", "Disease.onset", "Age.at.onset", "ALS.progresion.rate")]
+      colnames(clin) = c("maxomod_id","tube_id","patid", "disease", "sex", "age", "neurofilaments","genetics", "onset", "age_at_onset", "progression_rate")
+      
+      #make variables factor or numeric
+      clin$disease = as.factor(clin$disease)
+      clin$sex = as.factor(clin$sex)
+      clin$onset = as.factor(clin$onset)
+      clin$neurofilaments = as.numeric(clin$neurofilaments)
+      clin$genetics = as.factor(clin$genetics)
+      levels(clin$genetics) = c("C9orf72", "negative", "negative", "not_performed", "negative")
+      #create extra categorical variable for age based on median
+      m = median(clin$age)
+      clin$age_cat = rep(NA, length(clin$age))
+      clin$age_cat[clin$age>=m] = "over_61"
+      clin$age_cat[clin$age<m] = "under_61"
+      clin$age_cat = as.factor(clin$age_cat)
+
+      #add center variable
+      clin$center = rep("munich", nrow(clin))
+      clin$center[grep("Ctr", clin$maxomod_id)] = "goettingen"
+      clin$center = as.factor(clin$center)
+      
+      Intensity_names = colnames(abu_data)[grep("Intensity.", colnames(abu_data))]
+      clin$tube_id = paste(rep("Intensity.", length(clin$tube_id)), clin$tube_id, sep = "")
+      clin$tube_id[!clin$tube_id %in% Intensity_names]  #missing phosphoproteomics from: "Intensity.ALS35"  "Intensity.ALS45"  "Intensity.CTRL4"  "Intensity.CTRL6"  "Intensity.CTRL15" "Intensity.CTRL32" "Intensity.CTRL34"
+      Intensity_names[!Intensity_names %in% clin$tube_id] #clinical variables complete
+      
+      rownames(clin) = clin$tube_id
+      clin = clin[Intensity_names ,] #align clinical variables with proteomics data order
+
+#make summarized experiments
+      
+      rownames(abu_data) = abu_data$name
+      abu_data = as.data.frame(abu_data)
+      
+      #make summarized experiment
+      abundance.columns <- grep("Intensity", colnames(abu_data)) # get abundance column numbers
+      experimental.design = clin[,c("tube_id","disease", "onset", "age", "sex", "neurofilaments", "genetics", "age_at_onset", "progression_rate", "age_cat", "center")]
+      colnames(experimental.design) = c("label","condition","onset", "age", "sex", "neurofilaments", "genetics", "age_at_onset", "progression_rate", "age_cat", "center")
+      experimental.design$replicate = 1:nrow(experimental.design)
+      se_abu_data <- make_se(abu_data, abundance.columns, experimental.design)
+      
+      #make separate summarized experiment with only ALS patients
+      #and onset as condition variable
+      abundance.columns <- grep("Intensity.ALS",colnames(abu_data)) # get abundance column numbers
+      tube_id_ALS = clin$tube_id[clin$disease=="als"]
+      experimental.design = clin[tube_id_ALS, c("tube_id","onset", "age", "sex", "neurofilaments", "genetics", "age_at_onset", "progression_rate", "age_cat", "center")]
+      colnames(experimental.design) = c("label","condition","age", "sex", "neurofilaments", "genetics", "age_at_onset", "progression_rate", "age_cat", "center")
+      experimental.design$replicate = 1:nrow(experimental.design)
+      se_abu_data_ALS <- make_se(abu_data, abundance.columns, experimental.design)
+      
+      # #sanity check:
+      # write_xlsx(clin[,c("maxomod_id","tube_id", "patid", "disease", "batch_clusters")], 
+      #            path = "results/for_marie_clinical_variables_and_batch.xlsx")
+
+```
+
+#Missing inspection
+
+```{r missing inspection}
+      
+      #all patients
+      vis_miss(as.data.frame(assay(se_abu_data)) ,show_perc = TRUE, show_perc_col = TRUE, cluster = F)
+      ggsave("plots/missing_vis_miss_heatmap_before.pdf", width = 11, height = 8, units = "in")
+      se_abu_data_filtered =  filter_proteins(se_abu_data, "fraction", min = 0.66)
+      vis_miss(as.data.frame(assay(se_abu_data_filtered)),show_perc = TRUE, show_perc_col = TRUE, cluster = F)
+      ggsave("plots/missing_vis_miss_heatmap_after.pdf", width = 11, height = 8, units = "in")
+      
+      #only ALS patients
+      vis_miss(as.data.frame(assay(se_abu_data_ALS)),show_perc = TRUE, show_perc_col = TRUE, cluster = F)
+      ggsave("plots/missing_vis_miss_heatmap_before_ALS.pdf", width = 11, height = 8, units = "in")
+      #filter values that are missing more than 20% in at least one condition
+      se_abu_data_filtered_ALS =  filter_proteins(se_abu_data_ALS, "fraction", min = 0.66)
+      vis_miss(as.data.frame(assay(se_abu_data_filtered_ALS)),show_perc = TRUE, show_perc_col = TRUE, cluster = F)
+      ggsave("plots/missing_vis_miss_heatmap_after_ALS.pdf", width = 11, height = 8, units = "in")
+      
+      #dimensions of the data
+      dim(se_abu_data)
+      dim(se_abu_data_filtered)
+      dim(se_abu_data_ALS)
+      dim(se_abu_data_filtered_ALS)
+      
+      table(se_abu_data$sex)
+      table(se_abu_data_ALS$sex)
+      
+      # % missing per patient:
+      round(apply(X = as.data.frame(assay(se_abu_data)), function(x) sum(is.na(x)), MARGIN = 2) / nrow(as.data.frame(assay(se_abu_data))) * 100 , 1)
+      round(apply(X = as.data.frame(assay(se_abu_data_filtered)), function(x) sum(is.na(x)), MARGIN = 2) / nrow(as.data.frame(assay(se_abu_data))) * 100 , 1)
+      
+      #variance for males and females
+      female = summary(rowVars(assay(se_abu_data_filtered[, se_abu_data_filtered$sex == "Female"])))
+      male = summary(rowVars(assay(se_abu_data_filtered[, se_abu_data_filtered$sex == "Male"])))
+      cbind(female,male)
+```
+
+## Imputation and normalization
+
+```{r imputation and normalization}
+set.seed(9)
+
+#all patients
+norm <- normalize_vsn(se_abu_data_filtered)
+
+#only ALS
+norm_ALS <- normalize_vsn(se_abu_data_filtered_ALS)
+
+#all patients
+norm_imp_MinProb <- impute(norm, fun = "MinProb", q=0.01)
+
+#only ALS
+norm_imp_MinProb_ALS <- impute(norm_ALS, fun = "MinProb", q=0.01)
+
+#all patients
+norm_imp_knn <- impute(norm, fun = "knn")
+
+#only ALS
+norm_imp_knn_ALS <- impute(norm_ALS, fun = "knn")
+
+data = list(imp_MinProb = norm_imp_MinProb,
+            imp_knn = norm_imp_knn,
+            imp_MinProb_ALS = norm_imp_MinProb_ALS, 
+            imp_knn_ALS = norm_imp_knn_ALS
+            )
+saveRDS(data, file = "results/summarized_experiments_imputed.rds")
+```
+
+## Differential expression analysis (DEx)
+
+```{r differential expression analysis}
+
+covariates = c("no_cov", "age_cov", "sex_cov", "age_sex_cov")
+covariates_f = c(~0 + condition, 
+                 ~0 + condition + age_cat, 
+                 ~0 + condition + sex, 
+                 ~0 + condition + age_cat + sex)
+patients = c("all_patients", "only_female", "only_male")
+patients_f = c(NA, "Female", "Male")
+res = list()
+
+l = 1
+for(k in 1:length(data)){
+  for(i in 1:length(covariates)){
+    for(j in 1:length(patients)){
+    
+       title = paste0(names(data)[k],"_",covariates[i], "_", patients[j])
+        d = data[[k]]
+        if(j >1) { d = d[,d$sex == patients_f[j]] }
+        control = "ctrl"
+        if(grepl("ALS", title)){control = "bulbar"}
+        if(i < 3 | j == 1){
+          print(title)
+          print(dim(d))
+          t = test_diff(d, type = "control", control = control,
+            test = NULL, design_formula = formula(covariates_f[[i]]))
+          res[[l]] = as.data.frame(t@elementMetadata@listData)
+          res[[l]]$fdr = p.adjust(res[[l]][,grep("p.val",colnames(res[[l]]))], method="BH")
+          print(dim(res[[l]]))
+          names(res)[l] = title
+          write.csv(res[[l]], file = paste0("results/DEx", title, ".csv"))
+          l = l+1
+          
+        }}}}
+
+saveRDS(res, file = "results/DEx_results_all_in_list.rds")
+```
+
+## Visualization 1: mean expressions boxplots
+
+```{r Visualization 1: mean expressions boxplots}
+
+#visualize every dataset, also raw
+data_all = list(raw = se_abu_data, filtered = se_abu_data_filtered, normalized = norm,
+                raw_ALS = se_abu_data_ALS, filtered_ALS = se_abu_data_filtered_ALS, normalized_ALS = norm_ALS)
+data_all = c(data_all, data)
+
+mean_expression_plot = function(data, file_sample, file_mass){
+  ggplot(data = reshape2::melt(data), aes(x=Var1, y=value)) +
+  geom_boxplot(color="darkseagreen4", fill="darkseagreen3") +
+  theme_set(theme_minimal()) +
+  theme_few() +
+  scale_colour_few() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  theme(axis.text=element_text(size=6))
+
+ggsave(file_sample, width = 11, height = 8, units = "in")
+
+ggplot(data = reshape2::melt(data), aes(x=reorder(as.factor(Var2),value), y=value)) +
+  geom_boxplot(color="darkseagreen4", fill="darkseagreen3") +
+  theme_set(theme_minimal()) +
+  theme_few() +
+  scale_colour_few() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  theme(axis.text=element_text(size=6))
+
+ggsave(file_mass, width = 11*2, height = 8, units = "in")
+}
+
+for(i in 1:length(data_all)){
+  mean_expression_plot(data = t(assay(data_all[[i]])), 
+                      file_sample = paste0("plots/boxplots_expression_each_sample_",
+                                            names(data_all)[i],
+                                            ".pdf"),
+                      file_mass = paste0("plots/boxplots_expression_each_protein_",
+                                            names(data_all)[i],
+                                            ".pdf"))
+}
+
+
+```
+
+## Visualization 1b: Density plot
+
+```{r Visualization 1b: Density plot}
+#density plots of clinical variables
+d = as.data.frame(cbind(clin[,c("sex", "age_cat", "disease")], as.data.frame(t(assay(data_all[["normalized"]])))))
+long <- melt(setDT(d), id.vars = c("sex", "age_cat", "disease"), variable.name = "protein")
+
+#density plots for variables with and without missing
+d = as.data.frame(assay(data_all[["normalized"]]))
+missing = apply(d, function(x) sum(is.na(x)) , MARGIN = 1)
+missing[missing>0] = "yes"
+missing[missing == 0] = "no"
+missing = as.factor(missing)
+d2 = cbind(missing,d)
+long2 <- melt(setDT(d2), id.vars = "missing", variable.name = "protein")
+
+a = ggplot(long, aes(x=value, color=sex)) +
+  geom_density() +
+  theme_few() +
+  scale_colour_few()
+b = ggplot(long, aes(x=value, color=age_cat)) +
+  geom_density() +
+  theme_few() +
+  scale_colour_few()
+c = ggplot(long, aes(x=value, color=disease)) +
+  geom_density() +
+  theme_few() +
+  scale_colour_few()
+d = ggplot(long2, aes(x=value, color=missing)) +
+  geom_density() +
+  theme_few() +
+  scale_colour_few()
+
+library(ggpubr)
+ggarrange(a,b,c,d, ncol = 2, nrow = 2)
+ggsave(file = "plots/density.pdf", width = 11, height = 8, units = "in")
+```
+
+## Visualization 2: heatmaps
+
+The visualizations with the heatmaps, especially the ones with column-wise clustering, show a very clear batch effect in the data. This batch effect remains if we use different imputation methods.
+
+```{r Visualization 2: heatmaps}
+library(readr)
+set.seed(9)
+#functions for saving the heatmaps as figures
+        
+        save_pheatmap_pdf <- function(x, filename, width=11/2, height=8/2) {
+           stopifnot(!missing(x))
+           stopifnot(!missing(filename))
+           pdf(filename, width=width, height=height)
+           grid::grid.newpage()
+           grid::grid.draw(x$gtable)
+           dev.off()
+        }
+        
+        make_pheatmap <- function(data, cluster_cols = T, main = "Heatmap", clustering_method = "ward.D"){
+          p = pheatmap::pheatmap(data, name = "expression", cutree_cols = 1,
+                  show_colnames = T,
+                  show_rownames = FALSE,
+                  fontsize = 6,
+                  fontsize_col = 3,
+                  annotation_col = annotation,
+                  annotation_colors = annotation_colours,
+                  color = viridis::viridis(100, option="G", direction = -1,),
+                  main = main,
+                  border_color=NA,
+                  cluster_cols = cluster_cols,
+                  clustering_method = clustering_method,
+                  na_col = "grey50")
+          return(p)
+        }
+        
+# all clustering methods:
+        method = "ward.D"
+
+# loop for all datasets and all methods          
+        for(i in 1:length(data)){
+          for(j in 1:length(method)){
+        title = paste0(names(data)[i], "_", method[j])  
+        print(title)
+      
+        # get annotations and dataframe ready
+        #annotations
+        if(!grepl("ALS", title)){
+        annotation = data.frame(group = as.factor(data[[i]]$condition), 
+                                sex = as.factor(data[[i]]$sex), 
+                                age = data[[i]]$age, 
+                                onset = as.factor(data[[i]]$onset), 
+                                neurofilaments = data[[i]]$neurofilaments,
+                                genetics = data[[i]]$genetics, 
+                                progression_rate = data[[i]]$progression_rate)
+        rownames(annotation) = data[[i]]@colData$ID
+        annotation_colours <- list(
+          group = c(ctrl = "darkseagreen3", als = "darksalmon"), 
+          sex = c(Female = "lightpink", Male ="lightblue3"), 
+          age = c("white", "darkgreen"), 
+          onset = c(ctrl = "grey50", spinal = "mediumpurple1", bulbar = "mediumaquamarine"),
+          neurofilaments = c("white", "royalblue"),
+          genetics = c(not_performed = "grey80", C9orf72 = "aquamarine4", negative = "salmon"),
+          progression_rate = c("yellow", "red"))
+        }
+                if(grepl("ALS", title)){
+        annotation = data.frame(group = as.factor(data[[i]]$condition), 
+                                sex = as.factor(data[[i]]$sex), 
+                                age_at_onset = data[[i]]$age_at_onset, 
+                                neurofilaments = data[[i]]$neurofilaments,
+                                genetics = data[[i]]$genetics, 
+                                progression_rate = data[[i]]$progression_rate)
+        rownames(annotation) = data[[i]]@colData$ID
+        annotation_colours <- list(
+          group = c(spinal = "mediumpurple1", bulbar = "mediumaquamarine"),
+          sex = c(Female = "lightpink", Male ="lightblue3"), 
+          age_at_onset = c("white", "darkgreen"),
+          neurofilaments = c("white", "royalblue"),
+          genetics = c(not_performed = "grey80", C9orf72 = "aquamarine4", negative = "salmon"),
+          progression_rate = c("yellow", "red"))
+        }
+
+#create heatmaps with all patients
+        
+        #without grouping, all proteins
+        p = make_pheatmap(data = assay(data[[i]]), cluster_cols = T, main = paste0("Heatmap all proteins\n",title, "\nclustered"), clustering_method = method[j])
+        save_pheatmap_pdf(p, filename = paste0("plots/heatmap_clustered_",title,".pdf"))
+        
+        # without grouping, 100 most variable proteins
+        d = assay(data[[i]])
+        d2 = head(order(rowVars(d),decreasing = T),100)
+        p = make_pheatmap(data = d[d2,], cluster_cols = T, main = paste0("Heatmap 100 most variable proteins\n",title, "\nclustered"), clustering_method = method[j])
+        save_pheatmap_pdf(p, filename = paste0("plots/heatmap_clustered_mostvar_",title,".pdf"))
+        save_pheatmap_pdf(p, filename = paste0("plots/heatmap_clustered_mostvar_",title,"_big.pdf"), width=11, height=8)
+        
+        #heatmap with only significant genes
+        r = res[["imp_MinProb_no_cov_only_male"]]
+        sig_met = r$name[r$fdr<0.1]
+            if(length(sig_met)>2){
+              d = d[sig_met,]
+              p = make_pheatmap(data = d, cluster_cols = T, main = paste0("Heatmap only significant proteins (FDR 0.1)\n",title, "\nclustered","\n using model imp_MinProb_no_cov_only_male" ), clustering_method = method[j])
+              save_pheatmap_pdf(p, paste0("plots/heatmap_clustered_only_significant_",title,".pdf"))
+            }}}
+        
+#collect clustering labels ALS patients MinProb imputation Ward.D2 clustering
+        set.seed(9)
+        i = "imp_MinProb_ALS"
+        title = paste0(i, "_", method[j])
+        # without grouping, 100 most variable proteins
+        (d = assay(data[[i]]))
+        d2 = head(order(rowVars(d),decreasing = T),100)
+        p = make_pheatmap(data = d[d2,], cluster_cols = T, main = paste0("Heatmap 100 most variable proteins\n",title, "\nclustered"), clustering_method = method[j])
+        cluster_labels = as.data.frame(sort(cutree(p$tree_col, k=2)))
+        colnames(cluster_labels) = "cluster"
+        patids = as.data.frame(data[[i]]@colData[,c("ID", "label")])
+        
+        cluster_labels  = merge(cluster_labels, patids, by = "row.names", all = TRUE)
+        write_csv(cluster_labels, file="results/cluster_labels_heatmap_MinProb_ALS_Ward.D2.csv")
+        saveRDS(data[[i]], file = "results/summarized_experiment_for_clustering_imp_MinProb_ALS_ward.D2.rds")
+        
+
+
+```
+
+## Visualization 3: UMAP plots
+
+The UMAP plots also show a clear batch effect. With these plots, we can also see that it is not related to a clinical variable.
+
+```{r Visualization 3: UMAP plots}
+# set seed for reproducible results
+set.seed(9)
+          
+          group = c("darksalmon","darkseagreen3")
+          sex = c("lightpink", "lightblue3")
+          onset = c("mediumaquamarine", "mediumpurple1","grey80")
+          onset_ALS = c("mediumaquamarine", "mediumpurple1")
+          age_cat = c("darkgreen", "lightgreen")
+          center = c("blue3", "yellow4")
+
+        
+#THE FUNCTION 
+
+UMAP_density_plot = function(data, 
+                             ggtitle = "UMAP with disease status labels", 
+                             legend_name = "Disease status", 
+                             labels = clin$Condition, 
+                             colour_set = c("seagreen4", "slateblue1", "salmon"), 
+                             shape = rep(16, nrow(umap_plot)), 
+                             shapeTF = F){
+      # run umap function
+      umap_out = umap::umap(data)
+      umap_plot = as.data.frame(umap_out$layout)
+      
+      #add condition labels
+      umap_plot$group = labels
+
+      # plot umap
+      p1 = ggplot(umap_plot) + geom_point(aes(x=V1, y=V2, color = as.factor(group),), shape=shape) +
+        ggtitle(ggtitle) +
+          theme_few() +
+          scale_colour_few() +
+          scale_color_manual(name = legend_name, 
+                           labels = levels(as.factor(umap_plot$group)), 
+                           values = colour_set) + 
+          scale_fill_manual(values=colour_set)  
+
+      #add shape argument if we want to change shapes
+      if(shapeTF){
+        p1 = p1 + scale_shape_manual(name = "Sex", 
+                    labels = levels(as.factor(shape)), 
+                    values=c(15, 17))
+      }
+  
+      xdens <- 
+        axis_canvas(p1, axis = "x") + 
+        geom_density(data = umap_plot, aes(x = V1, fill = group, colour = group), alpha = 0.3) +
+        scale_fill_manual( values = colour_set) + 
+        scale_colour_manual( values = colour_set)
+      ydens <-
+        axis_canvas(p1, axis = "y", coord_flip = TRUE) + 
+        geom_density(data = umap_plot, aes(x = V2, fill = group, colour = group), alpha = 0.3) +
+        coord_flip() +
+        scale_fill_manual(values = colour_set) + 
+        scale_colour_manual( values = colour_set)
+      p1 %>%
+        insert_xaxis_grob(xdens, grid::unit(1, "in"), position = "top") %>%
+        insert_yaxis_grob(ydens, grid::unit(1, "in"), position = "right") %>%
+        ggdraw()
+      
+      p1
+      p1_label = p1 + geom_text(label = rownames(umap_plot), x = umap_plot$V1, y = umap_plot$V2,
+                     hjust = 0, nudge_x = 1, size = 1.5, colour = "grey")
+      return(list(plot_simple = p1, plot_with_labels = p1_label))
+}
+
+plots = list()
+plots_with_labels = list()
+l = 1
+
+for(i in 1:length(data)){
+  title = names(data)[i]
+  d = t(assay(data[[i]]))
+  labels_disease = data[[i]]$condition
+  if(!grepl("ALS", title)){labels_onset = data[[i]]$onset} #only run this one when we have case & control
+  labels_sex = data[[i]]$sex
+  labels_age = data[[i]]$age_cat
+  labels_center = data[[i]]$center
+  if(grepl("ALS", title)){group = onset_ALS} #change the colour labels when switching from case & control to only ALS
+      
+#perform plots with function      
+        umap = UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with disease status labels\n", title), 
+                          legend_name = "Disease status", 
+                          labels = labels_disease, 
+                          colour_set = group)
+        plots[[l]] = umap$plot_simple
+        plots_with_labels[[l]] =  umap$plot_with_labels
+        names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_disease")
+        l = l+1
+
+        
+        #disease color AND sex label
+        umap =  UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with disease status labels & sex shape\n", title), 
+                          legend_name = "Disease status", 
+                          labels = labels_disease, 
+                          colour_set = group,
+                          shape = labels_sex,
+                          shapeTF = T)
+        plots[[l]] = umap$plot_simple
+        plots_with_labels[[l]] =  umap$plot_with_labels
+        names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_disease_and_sex")
+        l = l+1
+
+        umap = UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with center labels\n", title), 
+                          legend_name = "Center", 
+                          labels = labels_center, 
+                          colour_set = center)
+        plots[[l]] = umap$plot_simple
+        plots_with_labels[[l]] =  umap$plot_with_labels
+        names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_center")
+        l = l+1
+         
+        if(!grepl("ALS", title)){ #only run this one when we have case & control
+          umap = UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with onset status labels\n", title), 
+                          legend_name = "Onset labels", 
+                          labels = labels_onset, 
+                          colour_set = onset)
+          plots[[l]] = umap$plot_simple
+          plots_with_labels[[l]] =  umap$plot_with_labels
+          names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_onset")
+          l = l+1
+        }
+        
+        umap = UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with sex labels\n", title), 
+                          legend_name = "Sex label", 
+                          labels = labels_sex, 
+                          colour_set = sex)
+        plots[[l]] = umap$plot_simple
+        plots_with_labels[[l]] =  umap$plot_with_labels
+        names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_sex")
+        l = l+1
+
+        umap = UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with age labels\n", title), 
+                          legend_name = "Age label", 
+                          labels = labels_age, 
+                          colour_set = age_cat)
+        plots[[l]] = umap$plot_simple
+        plots_with_labels[[l]] =  umap$plot_with_labels
+        names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_age")
+        l = l+1
+        
+#perform plots with only most variable proteins      
+        d2 = head(order(colVars(d),decreasing = T),100)
+        title = paste0("mostvar_",title)
+        
+        umap = UMAP_density_plot(data = d[,d2], 
+                          ggtitle = paste0("UMAP with disease status labels\n", title, "\nwith 100 most variable proteins"), 
+                          legend_name = "Disease status", 
+                          labels = labels_disease, 
+                          colour_set = group)
+        plots[[l]] = umap$plot_simple
+        plots_with_labels[[l]] =  umap$plot_with_labels
+        names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_disease")
+        l = l+1
+        
+          #disease color AND sex label
+         umap = UMAP_density_plot(data = d[,d2], 
+                          ggtitle = paste0("UMAP with disease status labels & sex shape\n", title, "\nwith 100 most variable proteins"), 
+                          legend_name = "Disease status", 
+                          labels = labels_disease, 
+                          colour_set = group,
+                          shape = labels_sex,
+                          shapeTF = T)
+        plots[[l]] = umap$plot_simple
+        plots_with_labels[[l]] =  umap$plot_with_labels
+        names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_disease_and_sex")
+        l = l+1
+        
+        if(!grepl("ALS", title)){ #only run this one when we have case & control
+          umap = UMAP_density_plot(data = d[,d2], 
+                            ggtitle = paste0("UMAP with onset status labels\n", title, "\nwith 100 most variable proteins"), 
+                            legend_name = "Onset labels", 
+                            labels = labels_onset, 
+                            colour_set = onset)
+            plots[[l]] = umap$plot_simple
+            plots_with_labels[[l]] =  umap$plot_with_labels
+            names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_onset")
+            l = l+1}
+        
+        umap = UMAP_density_plot(data = d[,d2], 
+                          ggtitle = paste0("UMAP with sex labels\n", title, "\nwith 100 most variable proteins"), 
+                          legend_name = "Sex label", 
+                          labels = labels_sex, 
+                          colour_set = sex)
+        plots[[l]] = umap$plot_simple
+        plots_with_labels[[l]] =  umap$plot_with_labels
+        names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_sex")
+        l = l+1
+        
+        umap = UMAP_density_plot(data = d[,d2], 
+                          ggtitle = paste0("UMAP with age labels\n", title, "\nwith 100 most variable proteins"), 
+                          legend_name = "Age label", 
+                          labels = labels_age, 
+                          colour_set = age_cat)
+        plots[[l]] = umap$plot_simple
+        plots_with_labels[[l]] =  umap$plot_with_labels
+        names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_age")
+        l = l+1
+        
+        umap = UMAP_density_plot(data = d[,d2], 
+                          ggtitle = paste0("UMAP with center labels\n", title, "\nwith 100 most variable proteins"), 
+                          legend_name = "Center label", 
+                          labels = labels_center, 
+                          colour_set = center)
+        plots[[l]] = umap$plot_simple
+        plots_with_labels[[l]] =  umap$plot_with_labels
+        names(plots)[l] = names(plots_with_labels)[l] = paste0(title, "_center")
+        l = l+1
+}
+
+#plot the unlabeled
+plots_MinProb = plots[grep("MinProb", names(plots))]
+plots_MinProb_ALS = plots_MinProb[grep("ALS", names(plots_MinProb))]
+plots_MinProb_all = plots_MinProb[-grep("ALS", names(plots_MinProb))]
+plots_knn = plots[grep("knn", names(plots))]
+plots_knn_ALS = plots_knn[grep("ALS", names(plots_knn))]
+plots_knn_all = plots_knn[-grep("ALS", names(plots_knn))]
+
+allplots <- ggarrange(plotlist=plots_MinProb_ALS,
+                                  ncol = 5, nrow = 2)
+ggsave("plots/UMAPs_MinProb_ALS.pdf", width = 5*5, height = 3*2, units = "in") 
+allplots <- ggarrange(plotlist=plots_MinProb_all,
+                                  ncol = 6, nrow = 2)
+ggsave("plots/UMAPs_MinProb_all.pdf", width = 5*6, height = 3*2, units = "in") 
+allplots <- ggarrange(plotlist=plots_knn_ALS,
+                                  ncol = 5, nrow = 2)
+ggsave("plots/UMAPs_knn_ALS.pdf", width = 5*5, height = 3*2, units = "in") 
+allplots <- ggarrange(plotlist=plots_knn_all,
+                                  ncol = 6, nrow = 2)
+ggsave("plots/UMAPs_knn_all.pdf", width = 5*6, height = 3*2, units = "in") 
+
+#plot the labeled
+plots_MinProb = plots_with_labels[grep("MinProb", names(plots_with_labels))]
+plots_MinProb_ALS = plots_MinProb[grep("ALS", names(plots_MinProb))]
+plots_MinProb_all = plots_MinProb[-grep("ALS", names(plots_MinProb))]
+plots_knn = plots_with_labels[grep("knn", names(plots_with_labels))]
+plots_knn_ALS = plots_knn[grep("ALS", names(plots_knn))]
+plots_knn_all = plots_knn[-grep("ALS", names(plots_knn))]
+
+allplots <- ggarrange(plotlist=plots_MinProb_ALS,
+                                  ncol = 5, nrow = 2)
+ggsave("plots/UMAPs_MinProb_ALS_labeled.pdf", width = 5*5, height = 3*2, units = "in", limitsize = F) 
+allplots <- ggarrange(plotlist=plots_MinProb_all,
+                                  ncol = 6, nrow = 2)
+ggsave("plots/UMAPs_MinProb_all_labeled.pdf", width = 5*6, height = 3*2, units = "in", limitsize = F) 
+allplots <- ggarrange(plotlist=plots_knn_ALS,
+                                  ncol = 5, nrow = 2)
+ggsave("plots/UMAPs_knn_ALS_labeled.pdf", width = 5*5, height = 3*2, units = "in", limitsize = F) 
+allplots <- ggarrange(plotlist=plots_knn_all,
+                                  ncol = 6, nrow = 2)
+ggsave("plots/UMAPs_knn_all_labeled.pdf", width = 5*6, height = 3*2, units = "in", limitsize = F) 
+
+```
+
+## Visualization 4: Volcano plots
+
+```{r Visualization 4: volcano plots}
+
+volcano_plot <- function(data_res, alpha_sig, name_title){
+  logFC = data_res[,grep("diff",colnames(data_res))]
+  fdr = data_res$fdr
+  df <- data.frame(x = logFC, 
+                   y = -log10(fdr),
+                   name = data_res$name)
+  names(df) <- c("x","y","name")
+  df <- df %>%
+    mutate(omic_type = case_when(x >= 0 & y >= (-log10(alpha_sig)) ~ "up",
+                                 x <= (0) & y >= (-log10(alpha_sig)) ~ "down",
+                                 TRUE ~ "ns")) 
+  cols <- c("up" = "#d4552b", "down" = "#26b3ff", "ns" = "grey") 
+  sizes <- c("up" = 2, "down" = 2, "ns" = 1) 
+  alphas <- c("up" = 0.7, "down" = 0.7, "ns" = 0.5)
+  ggplot(data = df, aes(x,y)) + 
+    geom_point(aes(colour = omic_type), 
+               alpha = 0.5, 
+               shape = 16,
+               size = 3) + 
+    geom_hline(yintercept = -log10(alpha_sig),
+               linetype = "dashed") + 
+    geom_vline(xintercept = 0,linetype = "dashed") +
+    geom_point(data = filter(df, y >= (-log10(alpha_sig))),
+               aes(colour = omic_type), 
+               alpha = 0.5, 
+               shape = 16,
+               size = 4) + 
+    #annotate(geom="text", x=-1.9, y= (-log10(alpha_sig)) + 0.15, label="FDR = 10%",size = 5) +
+    geom_text_repel(data = filter(df, y >= (-log10(alpha_sig)) & y > 0),
+                     aes(label = name),
+                     force = 1,
+                    hjust = 1,
+                     nudge_x = - 0.3,
+                    nudge_y = 0.1,
+                    #direction = "x",
+                     max.overlaps = 5,
+                    segment.size = 0.2,
+                     size = 4) +
+    geom_text_repel(data = filter(df, y >= (-log10(alpha_sig)) & y < 0),
+                    aes(label = name),
+                    force = 1,
+                    hjust = 0,
+                    nudge_x = 0.3,
+                    nudge_y = 0.1,
+                    #direction = "y",
+                    max.overlaps = 5,
+                    size = 4) +
+    scale_colour_manual(values = cols) + 
+    scale_fill_manual(values = cols) + 
+    scale_x_continuous(expand = c(0, 0), 
+                       limits = c(-4, 4)) + 
+    scale_y_continuous(expand = c(0, 0), limits = c(-0.1, NA)) +
+    labs(title = name_title,
+         x = "log2(fold change)",
+         y = expression(-log[10] ~ "(adjusted p-value)"),
+         colour = "Differential \nExpression") +
+    theme_classic() + # Select theme with a white background  
+    theme(axis.title.y = element_text(size = 14),
+          axis.title.x = element_text(size = 14),
+          axis.text = element_text(size = 12),
+          plot.title = element_text(size = 15, hjust = 0.5),
+          text = element_text(size = 14)) +
+    annotate("text", x = 2, y = 1, label = paste0(sum(df$omic_type=="up"), " more abundant \n", sum(df$omic_type=="down"), " less abundant"))
+}
+
+plots = list()
+l = 1
+
+for(i in 1:length(res)){
+    plots[[l]] = volcano_plot(res[[i]], 0.05 , paste0("Volcano plot phosphoproteomics \nalpha = FDR 0.05\n", names(res)[i]))
+    names(plots)[l] = paste0(names(res)[i], "_FDR0.05")
+    l = l+1
+    plots[[l]] = volcano_plot(res[[i]], 0.1 , paste0("Volcano plot phosphoproteomics \nalpha = FDR 0.1\n", names(res)[i]))
+    names(plots)[l] = paste0(names(res)[i], "_FDR0.1")
+    l = l+1
+}
+
+#plot MinProb plots with FDR 0.05 cut_off
+plots_MinProb = plots[grep("MinProb", names(plots))]
+plots_MinProb_0.05 = plots_MinProb[grep("0.05", names(plots_MinProb))]
+allplots <- ggarrange(plotlist=plots_MinProb_0.05,
+                                  ncol = 4, nrow = 4)
+ggsave("plots/Volcano_Plots_MinProb_0.05.pdf", width = 4*4*2, height = 3*4*2, units = "in", limitsize = F) 
+
+#plot MinProb plots with FDR 0.1 cut_off
+plots_MinProb = plots[grep("MinProb", names(plots))]
+plots_MinProb_0.1 = plots_MinProb[grep("0.1", names(plots_MinProb))]
+allplots <- ggarrange(plotlist=plots_MinProb_0.1,
+                                  ncol = 4, nrow = 4)
+ggsave("plots/Volcano_Plots_MinProb_0.1.pdf", width = 4*4*2, height = 3*4*2, units = "in", limitsize = F) 
+
+```
+
+
+## Redo the DEx with batch effect as a covariate
+
+By adding the batch as a covariate, we can correct for it in the DEx analysis. This helps us understand how much the batch effect is influencing our results. When discussing this batch effect with the lab in Strasbourg, that generated the data, they also couldn't explain where the batch effect was coming from. They suggested to only analyse the biggest subgroup within the batch effect instead of adding the batch effect as a covariate. I haven't had time to perform our analyses with only this subset of the patients. Marie Gebelin is currently looking into the data to figure out if she can find an explanation of the batch effect.
+
+```{r Redo the DEx with batch effect as a covariate}
+    library(writexl)
+    title = "batch_test"
+    batch_colour = c("salmon", "turquoise4")
+    plots = list()
+
+#perform hierarchical clustering to create 2 clusters for batch effect
+    d = as.data.frame(t(assay(norm_imp_MinProb)))
+    # Perform hierarchical clustering
+    distances <- dist(d)
+    hclust_result <- hclust(distances, method = "complete")  # You can use other methods like "average" or "single"
+    # Cut the dendrogram to create clusters
+    clusters <- as.factor(cutree(hclust_result, k = 2))
+    names(clusters) = norm_imp_MinProb$label
+
+#check if it has gone correctly using UMAP
+    umap = UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with presumable batch labels\n", title), 
+                          legend_name = "Batch", 
+                          labels = clusters, 
+                          colour_set = batch_colour)
+    plots$umap = umap$plot_simple
+    
+
+#perform DEx with the batch effect as a covariate
+    #make new se
+      abundance.columns <- grep("Intensity", colnames(abu_data)) # get abundance column numbers
+      clin$batch_clusters = clusters
+      experimental.design = clin[,c("tube_id","disease", "onset", "age", "sex", "neurofilaments", "genetics", "age_at_onset", "progression_rate", "age_cat", "center", "batch_clusters")]
+      colnames(experimental.design) = c("label","condition","onset", "age", "sex", "neurofilaments", "genetics", "age_at_onset", "progression_rate", "age_cat", "center", "batch_clusters")
+      experimental.design$replicate = 1:nrow(experimental.design)
+      se_abu_data_batch <- make_se(abu_data, abundance.columns, experimental.design)
+      se_abu_data_batch =  filter_proteins(se_abu_data_batch, "fraction", min = 0.66)
+      se_abu_data_batch <- normalize_vsn(se_abu_data_batch)
+      se_abu_data_batch <- impute(se_abu_data_batch, fun = "MinProb", q=0.01)
+      
+    
+      #set the covariates for the Dex 
+      covariates = "age_sex_batch_cov"
+      covariates_f =  ~0 + condition + age_cat + sex + batch_clusters
+      patients = "all_patients"
+      
+      #perform DEx   
+      title = "batch_experiment"
+      d = se_abu_data_batch
+      control = "ctrl"
+      t = test_diff(d, type = "control", control = control,
+                  test = NULL, design_formula = formula(covariates_f))
+                t = as.data.frame(t@elementMetadata@listData)
+                t$fdr = p.adjust(t[,grep("p.val",colnames(t))], method="BH")
+
+#create volcano plots
+      plots$volcano = volcano_plot(t, 0.05 , paste0("Volcano plot phosphoproteomics \nalpha = FDR 0.05\n", title,
+                                                    "\n sex, age, and batch as covariate\n MinProb imputed"))
+      
+#save
+      allplots <- ggarrange(plotlist=plots,
+                                  ncol = 2, nrow = 1)
+      ggsave("plots/Batch_experiment.pdf", width = 14, height = 5, units = "in") 
+      
+      
+      write_xlsx(clin[,c("maxomod_id", "tube_id", "patid", "disease", "batch_clusters")],
+                 path = "results/batch_experiment_clinical_vars.xlsx")
+      
+```
+
+## Redo the DEx with cluster subtypes
+
+The cluster assignments are retrieved from the proteomics clustering analysis. So they are based on the proteomics. Here, we test the clusters against eachother from the k-means k = 2 model and k = 3 model, to see if there are phosphoproteins that are differentially abundant between the clusters. 
+
+```{r Redo the DEx with cluster subtypes}
+    library(readxl)
+    cluster_colours = c(alpha ="#8DD3C7", beta="lightgoldenrod2", theta = "#BEBADA")
+
+    cluster_assignments = read_xlsx(
+      path = "data/cluster_assignments.xlsx")
+    cluster_assignments = cluster_assignments[,c("patid", "kmeans_k=2", "kmeans_k=3")]
+    cluster_assignments$`kmeans_k=2` = as.factor(cluster_assignments$`kmeans_k=2`)
+    
+    #change patid proteomics to patid phosphoproteoomics (because they're different)
+    prot_vs_phpr = read.csv(file = "data/Clinical_information_FINAL.csv")
+    prot_vs_phpr = prot_vs_phpr[, c("MAXOMOD.ID","Tube.ID","CSF.phosphoproteomics.ID", "CSF.proteomic..metabolomic..miRNA.ID")]
+    colnames(prot_vs_phpr) = c("maxomod_id","tube_id","phpr_id", "prot_id")
+    cluster_assignments$patid_phpr = rep(NA, nrow(cluster_assignments))
+    for(i in 1:nrow(cluster_assignments)){
+      cluster_assignments$patid_phpr[i] = prot_vs_phpr$phpr_id[prot_vs_phpr$prot_id == cluster_assignments$patid[i]]
+    }
+    #make patid_phpr new patid
+    cluster_assignments = cluster_assignments[,!colnames(cluster_assignments)=="patid"]
+    colnames(cluster_assignments)[colnames(cluster_assignments) == "patid_phpr"] = "patid"
+    
+    levels(cluster_assignments$`kmeans_k=2`) = c("alpha", "beta")
+    cluster_assignments$`kmeans_k=3` = as.factor(cluster_assignments$`kmeans_k=3`)
+    levels(cluster_assignments$`kmeans_k=3`) = c("alpha", "beta", "theta")
+    rownames(cluster_assignments) = cluster_assignments$patid
+    clin_ALS = clin[clin$disease == "als",]
+    cluster_assignments = cluster_assignments[clin_ALS$patid,]
+    clin_ALS$k2 = cluster_assignments$`kmeans_k=2`
+    clin_ALS$k3 = cluster_assignments$`kmeans_k=3`
+    
+    abu_data_ALS = abu_data[,c(clin_ALS$tube_id,"full_name","symbol", "uniprot", "ID", "name")]
+    rownames(abu_data_ALS) = abu_data_ALS$name
+    
+    #remove the patient with missing clustering
+    abu_data_ALS = abu_data_ALS[,!is.na(clin_ALS$k2)]
+    clin_ALS = clin_ALS[!is.na(clin_ALS$k2),]
+    
+
+#first for k = 2
+    
+      title = "clustering_k2"
+      plots = list()
+
+#perform DEx with the batch effect as a covariate
+      #make separate summarized experiment with only ALS patients
+      #and onset as condition variable
+      abundance.columns <- grep("Intensity.ALS",colnames(abu_data_ALS)) # get abundance column numbers
+      experimental.design = clin_ALS[,c("tube_id", "k2" ,"onset", "age", "sex", "neurofilaments", "genetics", "age_at_onset", "progression_rate", "age_cat", "center", "k3")]
+      colnames(experimental.design) = c("label","condition", "onset",  "age", "sex", "neurofilaments", "genetics", "age_at_onset", "progression_rate", "age_cat", "center", "k3")
+      abu_data_ALS$name = abu_data_ALS$ID = rownames(abu_data_ALS)
+      experimental.design$replicate = 1:nrow(experimental.design)
+      se_abu_data_ALS <- make_se(abu_data_ALS, abundance.columns, experimental.design)
+      se_abu_data_ALS =  filter_proteins(se_abu_data_ALS, "fraction", min = 0.66)
+      se_abu_data_ALS <- normalize_vsn(se_abu_data_ALS)
+      se_abu_data_ALS <- impute(se_abu_data_ALS, fun = "MinProb", q=0.01)
+    
+      #set the covariates for the Dex 
+      covariates = "age_sex_cov"
+      covariates_f =  ~0 + condition + age_cat + sex 
+      
+      #perform DEx   
+      d = se_abu_data_ALS
+      control = "beta"
+      t = test_diff(d, type = "control", control = control,
+                  test = NULL, design_formula = formula(covariates_f))
+      t = as.data.frame(t@elementMetadata@listData)
+      t$fdr = p.adjust(t[,grep("p.val",colnames(t))], method="BH")
+
+#create volcano plots
+      plots$volcano = volcano_plot(t, 0.05 , paste0("Volcano plot phosphoproteomics \nFDR 0.05 cut-off \nalpha vs beta \n", 
+                                                    title, "_", covariates,
+                                                    "\n MinProb imputed"))
+      
+#make UMAP
+    d = as.data.frame(t(assay(se_abu_data_ALS)))
+    umap = UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with cluster labels based on proteomics\n", title), 
+                          legend_name = "Cluster", 
+                          labels = clin_ALS$k2, 
+                          colour_set = cluster_colours)
+    plots$umap = umap$plot_simple
+
+#save
+      allplots <- ggarrange(plotlist=plots,
+                                  ncol = 2, nrow = 1)
+      ggsave("plots/DEx_clustering_from_proteomics_k2.pdf", width = 14, height = 5, units = "in") 
+      
+
+#now for k = 3
+    
+      title = "clustering_k3"
+      plots = list()
+
+#perform DEx with the batch effect as a covariate
+      #make separate summarized experiment with only ALS patients
+      #and onset as condition variable
+      abundance.columns <- grep("Intensity.ALS",colnames(abu_data_ALS)) # get abundance column numbers
+      experimental.design = clin_ALS[,c("tube_id", "k3" ,"onset", "age", "sex", "neurofilaments", "genetics", "age_at_onset", "progression_rate", "age_cat", "center", "k2")]
+      colnames(experimental.design) = c("label","condition", "onset",  "age", "sex", "neurofilaments", "genetics", "age_at_onset", "progression_rate", "age_cat", "center", "k2")
+      experimental.design$replicate = 1:nrow(experimental.design)
+      se_abu_data_ALS <- make_se(abu_data_ALS, abundance.columns, experimental.design)
+      se_abu_data_ALS =  filter_proteins(se_abu_data_ALS, "fraction", min = 0.66)
+      se_abu_data_ALS <- normalize_vsn(se_abu_data_ALS)
+      se_abu_data_ALS <- impute(se_abu_data_ALS, fun = "MinProb", q=0.01)
+    
+      #set the covariates for the Dex 
+      covariates = "age_sex_cov"
+      covariates_f =  ~0 + condition + age_cat + sex 
+      
+      #perform DEx   
+      d = se_abu_data_ALS
+      control = "beta"
+      t = test_diff(d, type = "all", control = control,
+                  test = NULL, design_formula = formula(covariates_f))
+      t = as.data.frame(t@elementMetadata@listData)
+      pval_cols = colnames(t)[grep("p.val", colnames(t))]
+      fdr_cols = gsub("p.val", "fdr", pval_cols)
+      diff_cols = gsub("p.val", "diff", pval_cols)
+      for(i in 1:length(pval_cols)){
+        t[,fdr_cols[i]] = p.adjust(t[,pval_cols[i]], method = "BH")
+      }
+
+#create volcano plots
+      for(i in 1:length(diff_cols)){
+        comparison = gsub("_diff", "", diff_cols[i])
+        t2 = t[,c("name", diff_cols[i], fdr_cols[i])]
+        colnames(t2) = c("name", "diff", "fdr")
+        plots[[i]] = volcano_plot(t2, 0.1 , paste0("Volcano plot phosphoproteomics \nFDR 0.1 cut-off \n", comparison, " \n", 
+                                                    title, "_", covariates,
+                                                    "\n MinProb imputed"))
+      }
+      
+#make UMAP
+    d = as.data.frame(t(assay(se_abu_data_ALS)))
+    umap = UMAP_density_plot(data = d, 
+                          ggtitle = paste0("UMAP with cluster labels based on proteomics\n", title), 
+                          legend_name = "Cluster", 
+                          labels = clin_ALS$k3, 
+                          colour_set = cluster_colours)
+    plots$umap = umap$plot_simple
+
+#save
+      allplots <- ggarrange(plotlist=plots,
+                                  ncol = 2, nrow = 2)
+      ggsave("plots/DEx_clustering_from_proteomics_k3.pdf", width = 14, height = 10, units = "in")
+      
+```
+
+## KSEA analysis
+
+For the KSEA analysis (Kinase-Substrate Enrichment Analysis) we can use the KSEAapp package. For more detailed explanation of how to use their KSEA function, you should visit their package manual. I haven't been able to perform this analysis yet. However, I gathered all the information and was almost ready to apply this analysis. This is what I know so far:
+
+For the KSEA function, we need a 'PX file' which contains the following columns (divided by necessary and optional):
+
+NECESSARY:
+
+- Gene = the HUGO gene name for the parent protein
+
+- Residue.Both = all phosphosites from that peptide, separated by semicolons if applicable; must be formatted as the single amino acid abbrev. with the residue position (e.g. S102)
+
+-  FC = the fold change (not log-transformed); usually the control sample is the denominator
+
+OPTIONAL:
+
+- Protein = the Uniprot Accession ID for the parent protein (if unavailable, write “NULL”)
+
+- Peptide = the peptide sequence (if unavailable, write “NULL”)
+
+-  p = the p-value of that peptide representing differential phosphorylation between the control and treatment group (if none calculated, please write “NULL”, cannot be NA)
+
+The 'gene', 'FC', 'Protein', and 'p' columns are easy to retrieve (see code below)
+The 'Residue.Both' will be a combination of two variables: phosphorylation site location and phosphorylated amino acid. In the ID variable from the 'abu_data' item, the site location is prefaces by the '_p' symbol. The amino acid that is phosphorylated, can be found in the "Phospho (STY) Probabilities" column in the original dataset. Here you just pick the amino acid with the highest probability.
+
+```{r KSEA analysis}
+library(KSEAapp)
+
+# TO DO
+# MAKE THE RESIDUE.BOTH VARIABLE
+
+    #phosphorylation site position can be found here:
+        
+        res$imp_MinProb_age_sex_cov_all_patients$Positions.within.proteins
+    
+    
+    #residue can be found in the Phospho (STY) Probabilities variable
+        phpr_data <- read.delim("data/Phospho (STY)Sites_pCSF_08.2023.txt")
+        phpr_data = phpr_data[phpr_data$Proteins %in% res$imp_MinProb_age_sex_cov_all_patients$orig_name,]
+        phpr_data$Phospho..STY..Probabilities[1:20] #extract the residue with the highest probability
+        
+    #subsequently, you have to make the variable like "S153"
+
+
+#To perform the analysis you have to make a PX dataframe:
+
+    PX = data.frame(
+      Gene = res$imp_MinProb_age_sex_cov_all_patients$symbol,
+      Protein = res$imp_MinProb_age_sex_cov_all_patients$uniprot,
+      #Residue.both = NULL, #THIS ONE YOU STILL HAVE TO MAKE 
+      FC = res$imp_MinProb_age_sex_cov_all_patients$als_vs_ctrl_diff,
+      p = res$imp_MinProb_age_sex_cov_all_patients$fdr
+    )
+
+#With this function you perform the analysis:
+    
+    #KSEA.Complete(KSData, PX, NetworKIN=TRUE, NetworKIN.cutoff=5, m.cutoff=5, p.cutoff=0.01)
+```
+
+## R and packages versions
+
+```{r session info}
+sessionInfo()
+```
+
